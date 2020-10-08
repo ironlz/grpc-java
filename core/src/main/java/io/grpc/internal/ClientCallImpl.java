@@ -40,12 +40,15 @@ import io.grpc.Context;
 import io.grpc.Context.CancellationListener;
 import io.grpc.Deadline;
 import io.grpc.DecompressorRegistry;
+import io.grpc.ForwardingClientCallListener.SimpleForwardingClientCallListener;
+import io.grpc.InternalConfigSelector;
 import io.grpc.InternalDecompressorRegistry;
 import io.grpc.LoadBalancer.PickSubchannelArgs;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
 import io.grpc.MethodDescriptor.MethodType;
 import io.grpc.Status;
+import io.grpc.internal.ManagedChannelServiceConfig.MethodInfo;
 import io.perfmark.Link;
 import io.perfmark.PerfMark;
 import io.perfmark.Tag;
@@ -72,47 +75,54 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
   private final MethodDescriptor<ReqT, RespT> method;
   private final Tag tag;
   private final Executor callExecutor;
+  private final boolean callExecutorIsDirect;
   private final CallTracer channelCallsTracer;
   private final Context context;
   private volatile ScheduledFuture<?> deadlineCancellationFuture;
   private final boolean unaryRequest;
-  private final CallOptions callOptions;
-  private final boolean retryEnabled;
+  private CallOptions callOptions;
   private ClientStream stream;
   private volatile boolean cancelListenersShouldBeRemoved;
   private boolean cancelCalled;
   private boolean halfCloseCalled;
-  private final ClientTransportProvider clientTransportProvider;
-  private final CancellationListener cancellationListener = new ContextCancellationListener();
+  private final ClientStreamProvider clientStreamProvider;
+  private final ContextCancellationListener cancellationListener =
+      new ContextCancellationListener();
   private final ScheduledExecutorService deadlineCancellationExecutor;
+  @Nullable
+  private final InternalConfigSelector configSelector;
   private boolean fullStreamDecompression;
   private DecompressorRegistry decompressorRegistry = DecompressorRegistry.getDefaultInstance();
   private CompressorRegistry compressorRegistry = CompressorRegistry.getDefaultInstance();
 
   ClientCallImpl(
       MethodDescriptor<ReqT, RespT> method, Executor executor, CallOptions callOptions,
-      ClientTransportProvider clientTransportProvider,
+      ClientStreamProvider clientStreamProvider,
       ScheduledExecutorService deadlineCancellationExecutor,
       CallTracer channelCallsTracer,
-      boolean retryEnabled) {
+      @Nullable InternalConfigSelector configSelector) {
     this.method = method;
     // TODO(carl-mastrangelo): consider moving this construction to ManagedChannelImpl.
     this.tag = PerfMark.createTag(method.getFullMethodName(), System.identityHashCode(this));
     // If we know that the executor is a direct executor, we don't need to wrap it with a
     // SerializingExecutor. This is purely for performance reasons.
     // See https://github.com/grpc/grpc-java/issues/368
-    this.callExecutor = executor == directExecutor()
-        ? new SerializeReentrantCallsDirectExecutor()
-        : new SerializingExecutor(executor);
+    if (executor == directExecutor()) {
+      this.callExecutor = new SerializeReentrantCallsDirectExecutor();
+      callExecutorIsDirect = true;
+    } else {
+      this.callExecutor = new SerializingExecutor(executor);
+      callExecutorIsDirect = false;
+    }
     this.channelCallsTracer = channelCallsTracer;
     // Propagate the context from the thread which initiated the call to all callbacks.
     this.context = Context.current();
     this.unaryRequest = method.getType() == MethodType.UNARY
         || method.getType() == MethodType.SERVER_STREAMING;
     this.callOptions = callOptions;
-    this.clientTransportProvider = clientTransportProvider;
+    this.clientStreamProvider = clientStreamProvider;
     this.deadlineCancellationExecutor = deadlineCancellationExecutor;
-    this.retryEnabled = retryEnabled;
+    this.configSelector = configSelector;
     PerfMark.event("ClientCall.<init>", tag);
   }
 
@@ -124,23 +134,14 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
   }
 
   /**
-   * Provider of {@link ClientTransport}s.
+   * Provider of {@link ClientStream}s.
    */
-  // TODO(zdapeng): replace the two APIs with a single API: newStream()
-  interface ClientTransportProvider {
-    /**
-     * Returns a transport for a new call.
-     *
-     * @param args object containing call arguments.
-     */
-    ClientTransport get(PickSubchannelArgs args);
-
-    <ReqT> ClientStream newRetriableStream(
-        MethodDescriptor<ReqT, ?> method,
+  interface ClientStreamProvider {
+    ClientStream newStream(
+        MethodDescriptor<?, ?> method,
         CallOptions callOptions,
         Metadata headers,
         Context context);
-
   }
 
   ClientCallImpl<ReqT, RespT> setFullStreamDecompression(boolean fullStreamDecompression) {
@@ -193,7 +194,7 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
     }
   }
 
-  private void startInternal(final Listener<RespT> observer, Metadata headers) {
+  private void startInternal(Listener<RespT> observer, Metadata headers) {
     checkState(stream == null, "Already started");
     checkState(!cancelCalled, "call was cancelled");
     checkNotNull(observer, "observer");
@@ -203,6 +204,7 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
       // Context is already cancelled so no need to create a real stream, just notify the observer
       // of cancellation via callback on the executor
       stream = NoopClientStream.INSTANCE;
+      final Listener<RespT> finalObserver = observer;
       class ClosedByContext extends ContextRunnable {
         ClosedByContext() {
           super(context);
@@ -210,19 +212,39 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
 
         @Override
         public void runInContext() {
-          closeObserver(observer, statusFromCancelled(context), new Metadata());
+          closeObserver(finalObserver, statusFromCancelled(context), new Metadata());
         }
       }
 
       callExecutor.execute(new ClosedByContext());
       return;
     }
+
+    if (configSelector != null) {
+      PickSubchannelArgs args = new PickSubchannelArgsImpl(method, headers, callOptions);
+      InternalConfigSelector.Result result = configSelector.selectConfig(args);
+      Status status = result.getStatus();
+      if (!status.isOk()) {
+        executeCloseObserverInContext(observer, status);
+        return;
+      }
+      callOptions = result.getCallOptions();
+      Runnable committedCallback = result.getCommittedCallback();
+      if (committedCallback != null) {
+        observer = new CommittedCallbackListener(observer, committedCallback);
+      }
+      ManagedChannelServiceConfig config = (ManagedChannelServiceConfig) result.getConfig();
+      MethodInfo methodInfo = config.getMethodConfig(method);
+      applyMethodConfig(methodInfo);
+    }
+
     final String compressorName = callOptions.getCompressor();
     Compressor compressor;
     if (compressorName != null) {
       compressor = compressorRegistry.lookupCompressor(compressorName);
       if (compressor == null) {
         stream = NoopClientStream.INSTANCE;
+        final Listener<RespT> finalObserver = observer;
         class ClosedByNotFoundCompressor extends ContextRunnable {
           ClosedByNotFoundCompressor() {
             super(context);
@@ -231,7 +253,7 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
           @Override
           public void runInContext() {
             closeObserver(
-                observer,
+                finalObserver,
                 Status.INTERNAL.withDescription(
                     String.format("Unable to find compressor by name %s", compressorName)),
                 new Metadata());
@@ -251,24 +273,16 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
     if (!deadlineExceeded) {
       logIfContextNarrowedTimeout(
           effectiveDeadline, context.getDeadline(), callOptions.getDeadline());
-      if (retryEnabled) {
-        stream = clientTransportProvider.newRetriableStream(method, callOptions, headers, context);
-      } else {
-        ClientTransport transport = clientTransportProvider.get(
-            new PickSubchannelArgsImpl(method, headers, callOptions));
-        Context origContext = context.attach();
-        try {
-          stream = transport.newStream(method, headers, callOptions);
-        } finally {
-          context.detach(origContext);
-        }
-      }
+      stream = clientStreamProvider.newStream(method, callOptions, headers, context);
     } else {
       stream = new FailingClientStream(
           DEADLINE_EXCEEDED.withDescription(
               "ClientCall started after deadline exceeded: " + effectiveDeadline));
     }
 
+    if (callExecutorIsDirect) {
+      stream.optimizeForDirectExecutor();
+    }
     if (callOptions.getAuthority() != null) {
       stream.setAuthority(callOptions.getAuthority());
     }
@@ -296,7 +310,7 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
     context.addListener(cancellationListener, directExecutor());
     if (effectiveDeadline != null
         // If the context has the effective deadline, we don't need to schedule an extra task.
-        && context.getDeadline() != effectiveDeadline
+        && !effectiveDeadline.equals(context.getDeadline())
         // If the channel has been terminated, we don't need to schedule an extra task.
         && deadlineCancellationExecutor != null) {
       deadlineCancellationFuture = startDeadlineTimer(effectiveDeadline);
@@ -310,11 +324,77 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
     }
   }
 
+  private final class CommittedCallbackListener extends
+      SimpleForwardingClientCallListener<RespT> {
+    final Runnable committedCallback;
+    boolean committed;
+
+    CommittedCallbackListener(Listener<RespT> delegate, Runnable committedCallback) {
+      super(delegate);
+      this.committedCallback = committedCallback;
+    }
+
+    @Override
+    public void onHeaders(Metadata headers) {
+      committed = true;
+      committedCallback.run();
+      delegate().onHeaders(headers);
+    }
+
+    @Override
+    public void onClose(Status status, Metadata trailers) {
+      if (!committed) {
+        committed = true;
+        committedCallback.run();
+      }
+      delegate().onClose(status, trailers);
+    }
+  }
+
+  private void applyMethodConfig(MethodInfo info) {
+    if (info == null) {
+      return;
+    }
+    callOptions = callOptions.withOption(MethodInfo.KEY, info);
+    if (info.timeoutNanos != null) {
+      Deadline newDeadline = Deadline.after(info.timeoutNanos, TimeUnit.NANOSECONDS);
+      Deadline existingDeadline = callOptions.getDeadline();
+      // If the new deadline is sooner than the existing deadline, swap them.
+      if (existingDeadline == null || newDeadline.compareTo(existingDeadline) < 0) {
+        callOptions = callOptions.withDeadline(newDeadline);
+      }
+    }
+    if (info.waitForReady != null) {
+      callOptions =
+          info.waitForReady ? callOptions.withWaitForReady() : callOptions.withoutWaitForReady();
+    }
+    if (info.maxInboundMessageSize != null) {
+      Integer existingLimit = callOptions.getMaxInboundMessageSize();
+      if (existingLimit != null) {
+        callOptions =
+            callOptions.withMaxInboundMessageSize(
+                Math.min(existingLimit, info.maxInboundMessageSize));
+      } else {
+        callOptions = callOptions.withMaxInboundMessageSize(info.maxInboundMessageSize);
+      }
+    }
+    if (info.maxOutboundMessageSize != null) {
+      Integer existingLimit = callOptions.getMaxOutboundMessageSize();
+      if (existingLimit != null) {
+        callOptions =
+            callOptions.withMaxOutboundMessageSize(
+                Math.min(existingLimit, info.maxOutboundMessageSize));
+      } else {
+        callOptions = callOptions.withMaxOutboundMessageSize(info.maxOutboundMessageSize);
+      }
+    }
+  }
+
   private static void logIfContextNarrowedTimeout(
       Deadline effectiveDeadline, @Nullable Deadline outerCallDeadline,
       @Nullable Deadline callDeadline) {
     if (!log.isLoggable(Level.FINE) || effectiveDeadline == null
-        || outerCallDeadline != effectiveDeadline) {
+        || !effectiveDeadline.equals(outerCallDeadline)) {
       return;
     }
 
@@ -352,8 +432,19 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
       stream.appendTimeoutInsight(insight);
       // DelayedStream.cancel() is safe to call from a thread that is different from where the
       // stream is created.
-      stream.cancel(DEADLINE_EXCEEDED.augmentDescription(
-              "deadline exceeded after " + remainingNanos + "ns. " + insight));
+      long seconds = Math.abs(remainingNanos) / TimeUnit.SECONDS.toNanos(1);
+      long nanos = Math.abs(remainingNanos) % TimeUnit.SECONDS.toNanos(1);
+
+      StringBuilder buf = new StringBuilder();
+      buf.append("deadline exceeded after ");
+      if (remainingNanos < 0) {
+        buf.append('-');
+      }
+      buf.append(seconds);
+      buf.append(String.format(".%09d", nanos));
+      buf.append("s. ");
+      buf.append(insight);
+      stream.cancel(DEADLINE_EXCEEDED.augmentDescription(buf.toString()));
     }
   }
 
@@ -362,6 +453,21 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
     return deadlineCancellationExecutor.schedule(
         new LogExceptionRunnable(
             new DeadlineTimer(remainingNanos)), remainingNanos, TimeUnit.NANOSECONDS);
+  }
+
+  private void executeCloseObserverInContext(final Listener<RespT> observer, final Status status) {
+    class CloseInContext extends ContextRunnable {
+      CloseInContext() {
+        super(context);
+      }
+
+      @Override
+      public void runInContext() {
+        closeObserver(observer, status, new Metadata());
+      }
+    }
+
+    callExecutor.execute(new CloseInContext());
   }
 
   @Nullable
@@ -389,7 +495,7 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
       checkArgument(numMessages >= 0, "Number requested must be non-negative");
       stream.request(numMessages);
     } finally {
-      PerfMark.stopTask("ClientCall.cancel", tag);
+      PerfMark.stopTask("ClientCall.request", tag);
     }
   }
 
@@ -517,10 +623,22 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
 
   private class ClientStreamListenerImpl implements ClientStreamListener {
     private final Listener<RespT> observer;
-    private boolean closed;
+    private Status exceptionStatus;
 
     public ClientStreamListenerImpl(Listener<RespT> observer) {
       this.observer = checkNotNull(observer, "observer");
+    }
+
+    /**
+     * Cancels call and schedules onClose() notification. May only be called from the application
+     * thread.
+     */
+    private void exceptionThrown(Status status) {
+      // Since each RPC can have its own executor, we can only call onClose() when we are sure there
+      // will be no further callbacks. We set the status here and overwrite the onClose() details
+      // when it arrives.
+      exceptionStatus = status;
+      stream.cancel(status);
     }
 
     @Override
@@ -545,16 +663,14 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
         }
 
         private void runInternal() {
-          if (closed) {
+          if (exceptionStatus != null) {
             return;
           }
           try {
             observer.onHeaders(headers);
           } catch (Throwable t) {
-            Status status =
-                Status.CANCELLED.withCause(t).withDescription("Failed to read headers");
-            stream.cancel(status);
-            close(status, new Metadata());
+            exceptionThrown(
+                Status.CANCELLED.withCause(t).withDescription("Failed to read headers"));
           }
         }
       }
@@ -588,7 +704,7 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
         }
 
         private void runInternal() {
-          if (closed) {
+          if (exceptionStatus != null) {
             GrpcUtil.closeQuietly(producer);
             return;
           }
@@ -605,10 +721,8 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
             }
           } catch (Throwable t) {
             GrpcUtil.closeQuietly(producer);
-            Status status =
-                Status.CANCELLED.withCause(t).withDescription("Failed to read message.");
-            stream.cancel(status);
-            close(status, new Metadata());
+            exceptionThrown(
+                Status.CANCELLED.withCause(t).withDescription("Failed to read message."));
           }
         }
       }
@@ -617,20 +731,6 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
         callExecutor.execute(new MessagesAvailable());
       } finally {
         PerfMark.stopTask("ClientStreamListener.messagesAvailable", tag);
-      }
-    }
-
-    /**
-     * Must be called from application thread.
-     */
-    private void close(Status status, Metadata trailers) {
-      closed = true;
-      cancelListenersShouldBeRemoved = true;
-      try {
-        closeObserver(observer, status, trailers);
-      } finally {
-        removeContextListenerAndCancelDeadlineFuture();
-        channelCallsTracer.reportCallEnded(status.isOk());
       }
     }
 
@@ -685,11 +785,25 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
         }
 
         private void runInternal() {
-          if (closed) {
-            // We intentionally don't keep the status or metadata from the server.
-            return;
+          Status status = savedStatus;
+          Metadata trailers = savedTrailers;
+          if (exceptionStatus != null) {
+            // Ideally exceptionStatus == savedStatus, as exceptionStatus was passed to cancel().
+            // However the cancel is racy and this closed() may have already been queued when the
+            // cancellation occurred. Since other calls like onMessage() will throw away data if
+            // exceptionStatus != null, it is semantically essential that we _not_ use a status
+            // provided by the server.
+            status = exceptionStatus;
+            // Replace trailers to prevent mixing sources of status and trailers.
+            trailers = new Metadata();
           }
-          close(savedStatus, savedTrailers);
+          cancelListenersShouldBeRemoved = true;
+          try {
+            closeObserver(observer, status, trailers);
+          } finally {
+            removeContextListenerAndCancelDeadlineFuture();
+            channelCallsTracer.reportCallEnded(status.isOk());
+          }
         }
       }
 
@@ -722,13 +836,14 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
         }
 
         private void runInternal() {
+          if (exceptionStatus != null) {
+            return;
+          }
           try {
             observer.onReady();
           } catch (Throwable t) {
-            Status status =
-                Status.CANCELLED.withCause(t).withDescription("Failed to call onReady.");
-            stream.cancel(status);
-            close(status, new Metadata());
+            exceptionThrown(
+                Status.CANCELLED.withCause(t).withDescription("Failed to call onReady."));
           }
         }
       }

@@ -1,19 +1,19 @@
-buildscript {
-    repositories { jcenter() }
-    dependencies { classpath 'com.github.jengelman.gradle.plugins:shadow:2.0.4' }
-}
+plugins {
+    id "java"
+    id "maven-publish"
 
-apply plugin: 'com.github.johnrengelman.shadow'
+    id "com.github.johnrengelman.shadow"
+}
 
 description = "gRPC: Netty Shaded"
 
 sourceSets { testShadow {} }
 
 dependencies {
-    compile project(':grpc-netty')
-    runtime libraries.netty_tcnative,
+    implementation project(':grpc-netty')
+    runtimeOnly libraries.netty_tcnative,
             libraries.netty_epoll
-    testShadowCompile files(shadowJar),
+    testShadowImplementation files(shadowJar),
             configurations.shadow,
             project(':grpc-testing-proto'),
             project(':grpc-testing'),
@@ -47,6 +47,9 @@ publishing {
         maven(MavenPublication) {
             // Ideally swap to project.shadow.component(it) when it isn't broken for project deps
             artifact shadowJar
+            // Empty jars are not published via withJavadocJar() and withSourcesJar()
+            artifact javadocJar
+            artifact sourcesJar
 
             pom.withXml {
                 def dependencies = asNode().appendNode('dependencies')

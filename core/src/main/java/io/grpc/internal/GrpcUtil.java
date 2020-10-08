@@ -42,6 +42,7 @@ import io.grpc.Status;
 import io.grpc.internal.ClientStreamListener.RpcProgress;
 import io.grpc.internal.SharedResourceHolder.Resource;
 import io.grpc.internal.StreamListener.MessageProducer;
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.InvocationTargetException;
@@ -62,6 +63,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.Nullable;
+import javax.annotation.concurrent.Immutable;
 
 /**
  * Common utilities for GRPC.
@@ -195,7 +197,7 @@ public final class GrpcUtil {
 
   public static final Splitter ACCEPT_ENCODING_SPLITTER = Splitter.on(',').trimResults();
 
-  private static final String IMPLEMENTATION_VERSION = "1.24.0-SNAPSHOT"; // CURRENT_GRPC_VERSION
+  private static final String IMPLEMENTATION_VERSION = "1.34.0-SNAPSHOT"; // CURRENT_GRPC_VERSION
 
   /**
    * The default timeout in nanos for a keepalive ping request.
@@ -443,6 +445,38 @@ public final class GrpcUtil {
     return builder.toString();
   }
 
+  @Immutable
+  public static final class GrpcBuildVersion {
+    private final String userAgent;
+    private final String implementationVersion;
+
+    private GrpcBuildVersion(String userAgent, String implementationVersion) {
+      this.userAgent = Preconditions.checkNotNull(userAgent, "userAgentName");
+      this.implementationVersion =
+          Preconditions.checkNotNull(implementationVersion, "implementationVersion");
+    }
+
+    public String getUserAgent() {
+      return userAgent;
+    }
+
+    public String getImplementationVersion() {
+      return implementationVersion;
+    }
+
+    @Override
+    public String toString() {
+      return userAgent + " " + implementationVersion;
+    }
+  }
+
+  /**
+   * Returns the build version of gRPC.
+   */
+  public static GrpcBuildVersion getGrpcBuildVersion() {
+    return new GrpcBuildVersion("gRPC Java", IMPLEMENTATION_VERSION);
+  }
+
   /**
    * Parse an authority into a URI for retrieving the host and port.
    */
@@ -474,6 +508,7 @@ public final class GrpcUtil {
   /**
    * Combine a host and port into an authority string.
    */
+  // There is a copy of this method in io.grpc.Grpc
   public static String authorityFromHostAndPort(String host, int port) {
     try {
       return new URI(null, null, host, port, null, null, null).getAuthority();
@@ -713,10 +748,10 @@ public final class GrpcUtil {
   }
 
   /**
-   * Closes an InputStream, ignoring IOExceptions.
+   * Closes a Closeable, ignoring IOExceptions.
    * This method exists because Guava's {@code Closeables.closeQuietly()} is beta.
    */
-  public static void closeQuietly(@Nullable InputStream message) {
+  public static void closeQuietly(@Nullable Closeable message) {
     if (message == null) {
       return;
     }

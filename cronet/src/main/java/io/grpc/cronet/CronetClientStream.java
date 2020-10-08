@@ -40,15 +40,16 @@ import io.grpc.internal.StatsTraceContext;
 import io.grpc.internal.TransportFrameUtil;
 import io.grpc.internal.TransportTracer;
 import io.grpc.internal.WritableBuffer;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
-import java.util.Queue;
 import java.util.concurrent.Executor;
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
@@ -64,6 +65,9 @@ class CronetClientStream extends AbstractClientStream {
   private static final int READ_BUFFER_CAPACITY = 4 * 1024;
   private static final ByteBuffer EMPTY_BUFFER = ByteBuffer.allocateDirect(0);
   private static final String LOG_TAG = "grpc-java-cronet";
+
+  private static volatile boolean loadAddRequestAnnotationAttempted;
+  private static volatile Method addRequestAnnotationMethod;
 
   @Deprecated
   static final CallOptions.Key<Object> CRONET_ANNOTATION_KEY =
@@ -102,10 +106,12 @@ class CronetClientStream extends AbstractClientStream {
       MethodDescriptor<?, ?> method,
       StatsTraceContext statsTraceCtx,
       CallOptions callOptions,
-      TransportTracer transportTracer) {
+      TransportTracer transportTracer,
+      boolean useGetForSafeMethods,
+      boolean usePutForIdempotentMethods) {
     super(
         new CronetWritableBufferAllocator(), statsTraceCtx, transportTracer, headers, callOptions,
-        method.isSafe());
+        useGetForSafeMethods && method.isSafe());
     this.url = Preconditions.checkNotNull(url, "url");
     this.userAgent = Preconditions.checkNotNull(userAgent, "userAgent");
     this.statsTraceCtx = Preconditions.checkNotNull(statsTraceCtx, "statsTraceCtx");
@@ -113,12 +119,16 @@ class CronetClientStream extends AbstractClientStream {
     this.headers = Preconditions.checkNotNull(headers, "headers");
     this.transport = Preconditions.checkNotNull(transport, "transport");
     this.startCallback = Preconditions.checkNotNull(startCallback, "startCallback");
-    this.idempotent = method.isIdempotent() || alwaysUsePut;
+    this.idempotent = (usePutForIdempotentMethods && method.isIdempotent()) || alwaysUsePut;
     // Only delay flushing header for unary rpcs.
     this.delayRequestHeader = (method.getType() == MethodDescriptor.MethodType.UNARY);
     this.annotation = callOptions.getOption(CRONET_ANNOTATION_KEY);
     this.annotations = callOptions.getOption(CRONET_ANNOTATIONS_KEY);
     this.state = new TransportState(maxMessageSize, statsTraceCtx, lock, transportTracer);
+
+    // Tests expect the "plain" deframer behavior, not MigratingDeframer
+    // https://github.com/grpc/grpc-java/issues/7140
+    optimizeForDirectExecutor();
   }
 
   @Override
@@ -182,12 +192,16 @@ class CronetClientStream extends AbstractClientStream {
       if (delayRequestHeader) {
         builder.delayRequestHeadersUntilFirstFlush(true);
       }
-      if (annotation != null) {
-        ((ExperimentalBidirectionalStream.Builder) builder).addRequestAnnotation(annotation);
-      }
-      if (annotations != null) {
-        for (Object o : annotations) {
-          ((ExperimentalBidirectionalStream.Builder) builder).addRequestAnnotation(o);
+      if (annotation != null || annotations != null) {
+        ExperimentalBidirectionalStream.Builder expBidiStreamBuilder =
+            (ExperimentalBidirectionalStream.Builder) builder;
+        if (annotation != null) {
+          addRequestAnnotation(expBidiStreamBuilder, annotation);
+        }
+        if (annotations != null) {
+          for (Object o : annotations) {
+            addRequestAnnotation(expBidiStreamBuilder, o);
+          }
         }
       }
       setGrpcHeaders(builder);
@@ -205,7 +219,7 @@ class CronetClientStream extends AbstractClientStream {
         ByteBuffer byteBuffer;
         if (buffer != null) {
           byteBuffer = ((CronetWritableBuffer) buffer).buffer();
-          byteBuffer.flip();
+          ((Buffer) byteBuffer).flip();
         } else {
           byteBuffer = EMPTY_BUFFER;
         }
@@ -215,13 +229,6 @@ class CronetClientStream extends AbstractClientStream {
         } else {
           streamWrite(byteBuffer, endOfStream, flush);
         }
-      }
-    }
-
-    @Override
-    public void request(final int numMessages) {
-      synchronized (state.lock) {
-        state.requestMessagesFromDeframer(numMessages);
       }
     }
 
@@ -247,7 +254,7 @@ class CronetClientStream extends AbstractClientStream {
   class TransportState extends Http2ClientStreamTransportState {
     private final Object lock;
     @GuardedBy("lock")
-    private Queue<PendingData> pendingData = new LinkedList<PendingData>();
+    private Collection<PendingData> pendingData = new ArrayList<PendingData>();
     @GuardedBy("lock")
     private boolean streamReady;
     @GuardedBy("lock")
@@ -359,6 +366,35 @@ class CronetClientStream extends AbstractClientStream {
         && !TE_HEADER.name().equalsIgnoreCase(key);
   }
 
+  private static void addRequestAnnotation(ExperimentalBidirectionalStream.Builder builder,
+      Object annotation) {
+    if (!loadAddRequestAnnotationAttempted) {
+      synchronized (CronetClientStream.class) {
+        if (!loadAddRequestAnnotationAttempted) {
+          try {
+            addRequestAnnotationMethod = ExperimentalBidirectionalStream.Builder.class
+                .getMethod("addRequestAnnotation", Object.class);
+          } catch (NoSuchMethodException e) {
+            Log.w(LOG_TAG,
+                "Failed to load method ExperimentalBidirectionalStream.Builder.addRequestAnnotation",
+                e);
+          } finally {
+            loadAddRequestAnnotationAttempted = true;
+          }
+        }
+      }
+    }
+    if (addRequestAnnotationMethod != null) {
+      try {
+        addRequestAnnotationMethod.invoke(builder, annotation);
+      } catch (InvocationTargetException e) {
+        throw new RuntimeException(e.getCause() == null ? e.getTargetException() : e.getCause());
+      } catch (IllegalAccessException e) {
+        Log.w(LOG_TAG, "Failed to add request annotation: " + annotation, e);
+      }
+    }
+  }
+
   private void setGrpcHeaders(BidirectionalStream.Builder builder) {
     // Psuedo-headers are set by cronet.
     // All non-pseudo headers must come after pseudo headers.
@@ -436,7 +472,7 @@ class CronetClientStream extends AbstractClientStream {
     @Override
     public void onReadCompleted(BidirectionalStream stream, UrlResponseInfo info,
         ByteBuffer buffer, boolean endOfStream) {
-      buffer.flip();
+      ((Buffer) buffer).flip();
       if (Log.isLoggable(LOG_TAG, Log.VERBOSE)) {
         Log.v(LOG_TAG, "onReadCompleted. Size=" + buffer.remaining());
       }

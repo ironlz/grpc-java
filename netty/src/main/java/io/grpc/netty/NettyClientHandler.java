@@ -46,6 +46,7 @@ import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPromise;
+import io.netty.handler.codec.http2.DecoratingHttp2FrameWriter;
 import io.netty.handler.codec.http2.DefaultHttp2Connection;
 import io.netty.handler.codec.http2.DefaultHttp2ConnectionDecoder;
 import io.netty.handler.codec.http2.DefaultHttp2ConnectionEncoder;
@@ -57,6 +58,7 @@ import io.netty.handler.codec.http2.Http2CodecUtil;
 import io.netty.handler.codec.http2.Http2Connection;
 import io.netty.handler.codec.http2.Http2ConnectionAdapter;
 import io.netty.handler.codec.http2.Http2ConnectionDecoder;
+import io.netty.handler.codec.http2.Http2ConnectionEncoder;
 import io.netty.handler.codec.http2.Http2Error;
 import io.netty.handler.codec.http2.Http2Exception;
 import io.netty.handler.codec.http2.Http2FlowController;
@@ -131,6 +133,7 @@ class NettyClientHandler extends AbstractNettyHandler {
   static NettyClientHandler newHandler(
       ClientTransportLifecycleManager lifecycleManager,
       @Nullable KeepAliveManager keepAliveManager,
+      boolean autoFlowControl,
       int flowControlWindow,
       int maxHeaderListSize,
       Supplier<Stopwatch> stopwatchFactory,
@@ -155,6 +158,7 @@ class NettyClientHandler extends AbstractNettyHandler {
         frameWriter,
         lifecycleManager,
         keepAliveManager,
+        autoFlowControl,
         flowControlWindow,
         maxHeaderListSize,
         stopwatchFactory,
@@ -171,6 +175,7 @@ class NettyClientHandler extends AbstractNettyHandler {
       Http2FrameWriter frameWriter,
       ClientTransportLifecycleManager lifecycleManager,
       KeepAliveManager keepAliveManager,
+      boolean autoFlowControl,
       int flowControlWindow,
       int maxHeaderListSize,
       Supplier<Stopwatch> stopwatchFactory,
@@ -192,8 +197,12 @@ class NettyClientHandler extends AbstractNettyHandler {
     frameReader = new Http2InboundFrameLogger(frameReader, frameLogger);
     frameWriter = new Http2OutboundFrameLogger(frameWriter, frameLogger);
 
-    StreamBufferingEncoder encoder = new StreamBufferingEncoder(
-        new DefaultHttp2ConnectionEncoder(connection, frameWriter));
+    PingCountingFrameWriter pingCounter;
+    frameWriter = pingCounter = new PingCountingFrameWriter(frameWriter);
+
+    StreamBufferingEncoder encoder =
+        new StreamBufferingEncoder(
+            new DefaultHttp2ConnectionEncoder(connection, frameWriter));
 
     // Create the local flow controller configured to auto-refill the connection window.
     connection.local().flowController(
@@ -230,12 +239,14 @@ class NettyClientHandler extends AbstractNettyHandler {
         tooManyPingsRunnable,
         transportTracer,
         eagAttributes,
-        authority);
+        authority,
+        autoFlowControl,
+        pingCounter);
   }
 
   private NettyClientHandler(
       Http2ConnectionDecoder decoder,
-      StreamBufferingEncoder encoder,
+      Http2ConnectionEncoder encoder,
       Http2Settings settings,
       ClientTransportLifecycleManager lifecycleManager,
       KeepAliveManager keepAliveManager,
@@ -243,8 +254,10 @@ class NettyClientHandler extends AbstractNettyHandler {
       final Runnable tooManyPingsRunnable,
       TransportTracer transportTracer,
       Attributes eagAttributes,
-      String authority) {
-    super(/* channelUnused= */ null, decoder, encoder, settings);
+      String authority,
+      boolean autoFlowControl,
+      PingLimiter pingLimiter) {
+    super(/* channelUnused= */ null, decoder, encoder, settings, autoFlowControl, pingLimiter);
     this.lifecycleManager = lifecycleManager;
     this.keepAliveManager = keepAliveManager;
     this.stopwatchFactory = stopwatchFactory;
@@ -268,7 +281,7 @@ class NettyClientHandler extends AbstractNettyHandler {
         if (errorCode == Http2Error.ENHANCE_YOUR_CALM.code()) {
           String data = new String(debugDataBytes, UTF_8);
           logger.log(
-              Level.WARNING, "Received GOAWAY with ENHANCE_YOUR_CALM. Debug data: {1}", data);
+              Level.WARNING, "Received GOAWAY with ENHANCE_YOUR_CALM. Debug data: {0}", data);
           if ("too_many_pings".equals(data)) {
             tooManyPingsRunnable.run();
           }
@@ -755,10 +768,21 @@ class NettyClientHandler extends AbstractNettyHandler {
 
   /**
    * Handler for a GOAWAY being received. Fails any streams created after the
-   * last known stream.
+   * last known stream. May only be called during a read.
    */
   private void goingAway(Status status) {
+    lifecycleManager.notifyGracefulShutdown(status);
+    // Try to allocate as many in-flight streams as possible, to reduce race window of
+    // https://github.com/grpc/grpc-java/issues/2562 . To be of any help, the server has to
+    // gracefully shut down the connection with two GOAWAYs. gRPC servers generally send a PING
+    // after the first GOAWAY, so they can very precisely detect when the GOAWAY has been
+    // processed and thus this processing must be in-line before processing additional reads.
+
+    // This can cause reentrancy, but should be minor since it is normal to handle writes in
+    // response to a read. Also, the call stack is rather shallow at this point
+    clientWriteQueue.drainNow();
     lifecycleManager.notifyShutdown(status);
+
     final Status goAwayStatus = lifecycleManager.getShutdownStatus();
     final int lastKnownStream = connection().local().lastStreamKnownByPeer();
     try {
@@ -891,6 +915,65 @@ class NettyClientHandler extends AbstractNettyHandler {
       if (keepAliveManager != null) {
         keepAliveManager.onDataReceived();
       }
+    }
+  }
+
+  private static class PingCountingFrameWriter extends DecoratingHttp2FrameWriter
+      implements AbstractNettyHandler.PingLimiter {
+    private int pingCount;
+
+    public PingCountingFrameWriter(Http2FrameWriter delegate) {
+      super(delegate);
+    }
+
+    @Override
+    public boolean isPingAllowed() {
+      // "3 strikes" may cause the server to complain, so we limit ourselves to 2 or below.
+      return pingCount < 2;
+    }
+
+    @Override
+    public ChannelFuture writeHeaders(
+        ChannelHandlerContext ctx, int streamId, Http2Headers headers,
+        int padding, boolean endStream, ChannelPromise promise) {
+      pingCount = 0;
+      return super.writeHeaders(ctx, streamId, headers, padding, endStream, promise);
+    }
+
+    @Override
+    public ChannelFuture writeHeaders(
+        ChannelHandlerContext ctx, int streamId, Http2Headers headers,
+        int streamDependency, short weight, boolean exclusive,
+        int padding, boolean endStream, ChannelPromise promise) {
+      pingCount = 0;
+      return super.writeHeaders(ctx, streamId, headers, streamDependency, weight, exclusive,
+          padding, endStream, promise);
+    }
+
+    @Override
+    public ChannelFuture writeWindowUpdate(
+        ChannelHandlerContext ctx, int streamId, int windowSizeIncrement, ChannelPromise promise) {
+      pingCount = 0;
+      return super.writeWindowUpdate(ctx, streamId, windowSizeIncrement, promise);
+    }
+
+    @Override
+    public ChannelFuture writePing(
+        ChannelHandlerContext ctx, boolean ack, long data, ChannelPromise promise) {
+      if (!ack) {
+        pingCount++;
+      }
+      return super.writePing(ctx, ack, data, promise);
+    }
+
+    @Override
+    public ChannelFuture writeData(
+        ChannelHandlerContext ctx, int streamId, ByteBuf data, int padding, boolean endStream,
+        ChannelPromise promise) {
+      if (data.isReadable()) {
+        pingCount = 0;
+      }
+      return super.writeData(ctx, streamId, data, padding, endStream, promise);
     }
   }
 }

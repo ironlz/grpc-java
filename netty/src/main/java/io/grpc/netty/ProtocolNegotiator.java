@@ -38,9 +38,18 @@ interface ProtocolNegotiator {
   ChannelHandler newHandler(GrpcHttp2ConnectionHandler grpcHandler);
 
   /**
-   * Releases resources held by this negotiator. Called when the Channel transitions to terminated.
-   * Is currently only supported on client-side; server-side protocol negotiators will not see this
-   * method called.
+   * Releases resources held by this negotiator. Called when the Channel transitions to terminated
+   * or when InternalServer is shutdown (depending on client or server). That means handlers
+   * returned by {@link #newHandler} can outlive their parent negotiator on server-side, but not
+   * on client-side.
    */
   void close();
+
+  interface ClientFactory {
+    /** Creates a new negotiator. */
+    ProtocolNegotiator newNegotiator();
+
+    /** Returns the implicit port to use if no port was specified explicitly by the user. */
+    int getDefaultPort();
+  }
 }
